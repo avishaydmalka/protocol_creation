@@ -557,14 +557,15 @@ async function waitActive(f) {
 }
 function deleteRemote(f) { if (f?.name) gemFetch('/v1beta/' + f.name, { method: 'DELETE' }).catch(() => {}); }
 
-async function gemini({ parts, system, schema = null }) {
+async function gemini({ parts, system, schema = null, onRetry = null }) {
   const model = store.get('model');
   const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.2 } };
   if (system) body.systemInstruction = { parts: [{ text: system }] };
   if (schema) { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.responseSchema = schema; }
   for (let attempt = 0; ; attempt++) {
+    const ac = new AbortController(), to = setTimeout(() => ac.abort(), 8 * 60 * 1000);
     try {
-      const r = await gemFetch(`/v1beta/${model}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const r = await gemFetch(`/v1beta/${model}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal });
       const j = await r.json();
       const cand = j.candidates?.[0];
       const text = (cand?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
@@ -579,9 +580,15 @@ async function gemini({ parts, system, schema = null }) {
         throw new UserError('Gemini החזיר פרוטוקול לא תקין. נסו שוב.');
       }
     } catch (e) {
-      if ([429, 500, 503].includes(e.status) && attempt < 3) { await sleep([4000, 12000, 25000][attempt]); continue; }
+      if (e?.name === 'AbortError') throw new UserError('Gemini לא ענה תוך 8 דקות. ייתכן שהמסך ננעל או שהחיבור נקטע. נסו שוב, או בחרו מודל Flash אחר בהגדרות.');
+      if ([429, 500, 503].includes(e.status) && attempt < 3) {
+        const wait = [10, 30, 60][attempt];
+        for (let s = wait; s > 0; s--) { onRetry?.(e.status === 429 ? `הגעתם למכסה לדקה הזו. ניסיון חוזר בעוד ${s} שניות` : `Gemini עמוס. ניסיון חוזר בעוד ${s} שניות`); await sleep(1000); }
+        onRetry?.(null);
+        continue;
+      }
       throw e;
-    }
+    } finally { clearTimeout(to); }
   }
 }
 
@@ -963,12 +970,19 @@ async function runPipeline(run) {
     setStep('wait', 'done');
 
     step = 'write'; setStep('write', 'run');
+    const t0 = Date.now(); let retryMsg = null;
+    const tick = setInterval(() => { if (!retryMsg) setStep('write', 'run', `כתיבת הפרוטוקול (${fmtDur((Date.now() - t0) / 1000)})`); }, 1000);
+    $('#procHint').textContent = `מודל: ${String(store.get('model')).replace('models/', '')}. ישיבה של שעה לוקחת בדרך כלל דקה עד שלוש דקות. השאירו את המסך דלוק והדף פתוח.`;
     const filePart = { file_data: { mime_type: remote.mimeType || mime, file_uri: remote.uri } };
-    const protocol = normalize(await gemini({
-      parts: [filePart, { text: contextText(run.meta) + '\n\nהאזן להקלטה המצורפת וכתוב פרוטוקול מלא של הישיבה לפי המבנה המבוקש.' }],
-      system: SYS_PROTOCOL, schema: SCHEMA
-    }));
-    setStep('write', 'done');
+    let protocol;
+    try {
+      protocol = normalize(await gemini({
+        parts: [filePart, { text: contextText(run.meta) + '\n\nהאזן להקלטה המצורפת וכתוב פרוטוקול מלא של הישיבה לפי המבנה המבוקש.' }],
+        system: SYS_PROTOCOL, schema: SCHEMA,
+        onRetry: m => { retryMsg = m; if (m) setStep('write', 'run', m); }
+      }));
+    } finally { clearInterval(tick); }
+    setStep('write', 'done', 'כתיבת הפרוטוקול');
 
     let transcript = '';
     if (run.transcript) {
