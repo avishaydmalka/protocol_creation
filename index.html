@@ -557,30 +557,83 @@ async function waitActive(f) {
 }
 function deleteRemote(f) { if (f?.name) gemFetch('/v1beta/' + f.name, { method: 'DELETE' }).catch(() => {}); }
 
-async function gemini({ parts, system, schema = null, onRetry = null }) {
+function thinkingFor(model) {
+  const n = String(model).replace('models/', '');
+  const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  if (v >= 3) return { thinkingLevel: 'low', includeThoughts: true };
+  if (v >= 2.5) return { thinkingBudget: /pro/.test(n) ? 1024 : 0, includeThoughts: true };
+  return null;
+}
+let noThinkingCfg = false;
+
+async function readSSE(res, onChunk, idleMs, ac) {
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '', idle;
+  const arm = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort('idle'), idleMs); };
+  arm();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      arm();
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).replace(/\r$/, ''); buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        let obj; try { obj = JSON.parse(data); } catch { continue; }
+        onChunk(obj);
+      }
+    }
+  } finally { clearTimeout(idle); }
+}
+
+async function gemini({ parts, system, schema = null, onRetry = null, onProgress = null }) {
   const model = store.get('model');
-  const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.2 } };
-  if (system) body.systemInstruction = { parts: [{ text: system }] };
-  if (schema) { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.responseSchema = schema; }
+  const build = withThinking => {
+    const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.2, maxOutputTokens: 32768 } };
+    if (system) body.systemInstruction = { parts: [{ text: system }] };
+    if (schema) { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.responseSchema = schema; }
+    const t = withThinking && thinkingFor(model);
+    if (t) body.generationConfig.thinkingConfig = t;
+    return body;
+  };
   for (let attempt = 0; ; attempt++) {
-    const ac = new AbortController(), to = setTimeout(() => ac.abort(), 8 * 60 * 1000);
+    const ac = new AbortController(), total = setTimeout(() => ac.abort('total'), 10 * 60 * 1000);
     try {
-      const r = await gemFetch(`/v1beta/${model}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal });
-      const j = await r.json();
-      const cand = j.candidates?.[0];
-      const text = (cand?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
+      const res = await gemFetch(`/v1beta/${model}:streamGenerateContent?alt=sse`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(build(!noThinkingCfg)), signal: ac.signal
+      });
+      let text = '', finish = '', blocked = false, thinking = false;
+      await readSSE(res, j => {
+        if (j.error) { const e = new Error(j.error.message || 'Gemini error'); e.status = j.error.code; throw e; }
+        if (j.promptFeedback?.blockReason) blocked = true;
+        const cand = j.candidates?.[0];
+        if (cand?.finishReason) finish = cand.finishReason;
+        for (const p of cand?.content?.parts || []) {
+          if (p.thought) thinking = true;
+          else if (p.text) { text += p.text; thinking = false; }
+        }
+        onProgress?.({ chars: text.length, thinking });
+      }, 120000, ac);
       if (!text) {
-        if (j.promptFeedback?.blockReason || cand?.finishReason === 'SAFETY') throw new UserError('Gemini סירב לעבד את ההקלטה. נסו שוב או בחרו מודל אחר.');
+        if (blocked || finish === 'SAFETY' || finish === 'PROHIBITED_CONTENT') throw new UserError('Gemini סירב לעבד את ההקלטה. נסו שוב או בחרו מודל אחר.');
         throw new UserError('התקבלה תשובה ריקה מ-Gemini. נסו שוב.');
       }
       if (!schema) return text.trim();
       try { return JSON.parse(text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')); }
       catch {
-        if (cand?.finishReason === 'MAX_TOKENS') throw new UserError('הפרוטוקול ארוך מדי לתשובה אחת. נסו לפצל את ההקלטה לשני חלקים.');
+        if (finish === 'MAX_TOKENS') throw new UserError('הפרוטוקול ארוך מדי לתשובה אחת. נסו לפצל את ההקלטה לשני חלקים.');
         throw new UserError('Gemini החזיר פרוטוקול לא תקין. נסו שוב.');
       }
     } catch (e) {
-      if (e?.name === 'AbortError') throw new UserError('Gemini לא ענה תוך 8 דקות. ייתכן שהמסך ננעל או שהחיבור נקטע. נסו שוב, או בחרו מודל Flash אחר בהגדרות.');
+      if (e?.status === 400 && !noThinkingCfg && /think/i.test(e.message || '')) { noThinkingCfg = true; attempt--; continue; }
+      if (e?.name === 'AbortError' || ac.signal.aborted) {
+        if (ac.signal.reason === 'idle' && attempt < 2) { onRetry?.('Gemini הפסיק לענות. מנסה שוב...'); await sleep(1500); onRetry?.(null); continue; }
+        throw new UserError('Gemini לא השלים את התשובה. ייתכן שהמסך ננעל או שהחיבור נקטע. נסו שוב, או בחרו מודל אחר בהגדרות.');
+      }
       if ([429, 500, 503].includes(e.status) && attempt < 3) {
         const wait = [10, 30, 60][attempt];
         for (let s = wait; s > 0; s--) { onRetry?.(e.status === 429 ? `הגעתם למכסה לדקה הזו. ניסיון חוזר בעוד ${s} שניות` : `Gemini עמוס. ניסיון חוזר בעוד ${s} שניות`); await sleep(1000); }
@@ -588,7 +641,7 @@ async function gemini({ parts, system, schema = null, onRetry = null }) {
         continue;
       }
       throw e;
-    } finally { clearTimeout(to); }
+    } finally { clearTimeout(total); }
   }
 }
 
@@ -970,8 +1023,13 @@ async function runPipeline(run) {
     setStep('wait', 'done');
 
     step = 'write'; setStep('write', 'run');
-    const t0 = Date.now(); let retryMsg = null;
-    const tick = setInterval(() => { if (!retryMsg) setStep('write', 'run', `כתיבת הפרוטוקול (${fmtDur((Date.now() - t0) / 1000)})`); }, 1000);
+    const t0 = Date.now(); let retryMsg = null, progress = null;
+    const tick = setInterval(() => {
+      if (retryMsg) return;
+      const el = fmtDur((Date.now() - t0) / 1000);
+      const what = !progress ? 'ממתין לתשובה' : progress.chars ? `התקבלו ${progress.chars.toLocaleString('he-IL')} תווים` : 'Gemini חושב';
+      setStep('write', 'run', `כתיבת הפרוטוקול (${el} · ${what})`);
+    }, 1000);
     $('#procHint').textContent = `מודל: ${String(store.get('model')).replace('models/', '')}. ישיבה של שעה לוקחת בדרך כלל דקה עד שלוש דקות. השאירו את המסך דלוק והדף פתוח.`;
     const filePart = { file_data: { mime_type: remote.mimeType || mime, file_uri: remote.uri } };
     let protocol;
@@ -979,7 +1037,8 @@ async function runPipeline(run) {
       protocol = normalize(await gemini({
         parts: [filePart, { text: contextText(run.meta) + '\n\nהאזן להקלטה המצורפת וכתוב פרוטוקול מלא של הישיבה לפי המבנה המבוקש.' }],
         system: SYS_PROTOCOL, schema: SCHEMA,
-        onRetry: m => { retryMsg = m; if (m) setStep('write', 'run', m); }
+        onRetry: m => { retryMsg = m; if (m) setStep('write', 'run', m); },
+        onProgress: pr => { progress = pr; }
       }));
     } finally { clearInterval(tick); }
     setStep('write', 'done', 'כתיבת הפרוטוקול');
