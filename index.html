@@ -179,9 +179,13 @@ details.transcript summary{cursor:pointer;font:700 19px var(--f-display)}
 details.transcript[open]{display:grid;gap:10px}
 .mono{font-family:var(--f-mono);font-size:13px}
 .danger{display:flex;justify-content:center}
+.diag-log{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--sunk);border-radius:8px;padding:10px;margin:0;max-height:260px;overflow:auto;text-align:left}
+.diag-steps{margin:0;padding-inline-start:20px;display:grid;gap:6px;font-size:14px}
+.diag-steps .ok{color:var(--accent)}
+.diag-steps .bad{color:var(--err);font-weight:600}
 .btn.danger-btn{color:var(--err)}
 .btn.danger-btn:hover{background:var(--err-soft)}
-dialog{border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--ink);padding:0;width:min(540px,calc(100vw - 32px));max-height:calc(100dvh - 32px)}
+dialog{border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--ink);padding:0;width:min(540px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto}
 dialog::backdrop{background:rgb(0 0 0 / .45)}
 .dlg{padding:20px;display:grid;gap:14px}
 .dlg-head{display:flex;justify-content:space-between;align-items:center}
@@ -355,6 +359,7 @@ hr{border:0;border-top:1px solid var(--line);width:100%;margin:4px 0}
       <ol class="psteps" id="psteps"></ol>
       <div class="pbar"><div id="pbarFill"></div></div>
       <p class="hint" id="procHint">ישיבה של שעה לוקחת בדרך כלל דקה עד שלוש דקות. השאירו את הדף פתוח.</p>
+      <details class="more"><summary>פרטים טכניים</summary><pre class="diag-log mono" dir="ltr"></pre></details>
       <div id="procErr" class="banner err" hidden>
         <p id="procErrMsg"></p>
         <div class="row-actions"><button class="btn primary small" id="procRetry" type="button">ניסיון חוזר</button><button class="btn ghost small" id="procBack" type="button">חזרה</button></div>
@@ -398,6 +403,10 @@ hr{border:0;border-top:1px solid var(--line);width:100%;margin:4px 0}
     <p class="hint">כתובת האפליקציה, ל-Authorized JavaScript origins: <code id="sOrigin" dir="ltr"></code></p>
     <div class="row-actions"><button type="button" class="btn ghost small" id="sGuide">הוראות החיבור ל-Google</button></div>
     <div class="row-actions"><button type="button" class="btn primary" id="sSave">שמירה</button><span class="msg" id="sMsg"></span></div>
+    <hr>
+    <div class="row-actions"><button type="button" class="btn small" id="sDiag">בדיקת חיבור מלאה</button><span class="hint">בודק שלב אחר שלב עם המודל שנבחר. לוקח עד שתי דקות.</span></div>
+    <ol id="sDiagOut" class="diag-steps" hidden></ol>
+    <details class="more" id="sDiagLogBox" hidden><summary>יומן מפורט</summary><pre class="diag-log mono" dir="ltr"></pre></details>
     <hr>
     <div><button type="button" class="btn ghost danger-btn small" id="sWipe">מחיקת כל הנתונים מהדפדפן</button></div>
   </form>
@@ -484,9 +493,22 @@ async function apiError(res) {
   try { const j = await res.json(); msg = j.error?.message || ''; } catch {}
   const e = new Error(msg || 'HTTP ' + res.status); e.status = res.status; return e;
 }
+const diag = [];
+function dlog(m) {
+  const d = new Date();
+  diag.push(`${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${m}`);
+  if (diag.length > 80) diag.shift();
+  for (const el of $$('.diag-log')) el.textContent = diag.join('\n');
+}
+const pathLabel = p => p.replace(/^\/(upload\/)?v1beta\//, '').replace(/\?.*$/, '').replace('models/', '');
 async function gemFetch(path, opts = {}, key = store.get('gemini_key')) {
-  const res = await fetch(GEM + path, { ...opts, headers: { 'x-goog-api-key': key, ...(opts.headers || {}) } });
-  if (!res.ok) throw await apiError(res);
+  const t0 = Date.now(), label = `${opts.method || 'GET'} ${pathLabel(path)}`;
+  dlog(label + ' ...');
+  let res;
+  try { res = await fetch(GEM + path, { ...opts, headers: { 'x-goog-api-key': key, ...(opts.headers || {}) } }); }
+  catch (e) { dlog(`${label} נכשל אחרי ${((Date.now() - t0) / 1000).toFixed(1)}s: ${opts.signal?.aborted ? 'בוטל (' + opts.signal.reason + ')' : (e.message || e)}`); throw e; }
+  dlog(`${label} -> ${res.status} אחרי ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  if (!res.ok) { const e = await apiError(res); dlog('שגיאה: ' + e.message.slice(0, 200)); throw e; }
   return res;
 }
 async function listModels(key) {
@@ -577,7 +599,7 @@ async function callModel(model, body, { onProgress = null, idleMs = 90000, total
     if (now - last > idleMs) ac.abort('idle');
     else if (now - start > totalMs) ac.abort('total');
   }, 1000);
-  let text = '', finish = '', blocked = false, thinking = false;
+  let text = '', finish = '', blocked = false, thinking = false, gotChunk = false;
   try {
     const res = await gemFetch(`/v1beta/${model}:streamGenerateContent?alt=sse`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal
@@ -605,9 +627,11 @@ async function callModel(model, body, { onProgress = null, idleMs = 90000, total
           if (p.thought) thinking = true;
           else if (p.text) { text += p.text; thinking = false; }
         }
+        if (!gotChunk) { gotChunk = true; dlog(`חלק ראשון אחרי ${((Date.now() - start) / 1000).toFixed(1)}s`); }
         onProgress?.({ chars: text.length, thinking, connected: true });
       }
     }
+    dlog(`הסתיים: ${text.length} תווים, finish=${finish || '-'}${blocked ? ', חסום' : ''}`);
     return { text, finish, blocked };
   } catch (e) {
     if (ac.signal.aborted) { const err = new Error('timeout'); err.timeout = ac.signal.reason || 'idle'; throw err; }
@@ -626,9 +650,11 @@ function buildBody(model, { parts, system, schema }) {
 
 function fallbackModels(current) {
   const ranked = rankModels(store.get('models', [])).filter(id => id !== current);
+  const ver = id => (String(id).match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '';
   const flash = ranked.filter(id => /flash/.test(id) && !/lite/.test(id));
-  const rest = ranked.filter(id => !flash.includes(id));
-  return [current, ...flash, ...rest].filter(Boolean).slice(0, 3);
+  const otherFamily = flash.filter(id => ver(id).split('.')[0] !== ver(current).split('.')[0]);
+  const order = [current, otherFamily[0], ...flash, ...ranked];
+  return [...new Set(order.filter(Boolean))].slice(0, 3);
 }
 
 async function gemini({ parts, system, schema = null, onRetry = null, onProgress = null, onModel = null }) {
@@ -675,6 +701,41 @@ async function gemini({ parts, system, schema = null, onRetry = null, onProgress
 }
 let lastModelTried = null;
 
+function toneWav(sec = 2, rate = 16000) {
+  const n = sec * rate, dv = new DataView(new ArrayBuffer(44 + n * 2)), w = (o, t) => [...t].forEach((c, k) => dv.setUint8(o + k, c.charCodeAt(0)));
+  w(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); w(36, 'data'); dv.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) dv.setInt16(44 + i * 2, Math.sin(2 * Math.PI * 440 * i / rate) * 8000, true);
+  return new Blob([dv.buffer], { type: 'audio/wav' });
+}
+async function runDiagnostics(model, out) {
+  const line = (t, cls = '') => { const li = h('li', { class: cls }, t); out.append(li); return li; };
+  const sec = t0 => ((Date.now() - t0) / 1000).toFixed(1) + ' שניות';
+  const step = async (title, fn) => {
+    const li = line(title + '...'), t0 = Date.now();
+    try { const extra = await fn(); li.textContent = `${title}: תקין (${sec(t0)})${extra ? ' · ' + extra : ''}`; li.className = 'ok'; return true; }
+    catch (e) { li.textContent = `${title}: נכשל (${sec(t0)}) · ${e.timeout ? 'אין תשובה' : (e.status ? e.status + ' ' : '') + (e.message || e)}`; li.className = 'bad'; return false; }
+  };
+  line(`מודל: ${shortName(model)} · דפדפן: ${navigator.userAgent.match(/(CriOS|FxiOS|EdgiOS|Chrome|Safari|Firefox)\/[\d.]+/)?.[0] || '?'}`);
+  await step('1. רשימת מודלים', async () => `${(await listModels(store.get('gemini_key'))).length} מודלים`);
+  await step('2. שאלת טקסט רגילה', async () => {
+    const ac = new AbortController(), to = setTimeout(() => ac.abort('timeout'), 45000);
+    try {
+      const r = await gemFetch(`/v1beta/${model}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: ac.signal,
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'ענה במילה אחת: שלום' }] }] }) });
+      const j = await r.json(); return '"' + ((j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text).join('').trim().slice(0, 30)) + '"';
+    } catch (e) { if (ac.signal.aborted) e.timeout = true; throw e; } finally { clearTimeout(to); }
+  });
+  await step('3. שאלת טקסט בזרימה', async () => '"' + (await callModel(model, buildBody(model, { parts: [{ text: 'ענה במילה אחת: שלום' }] }), { idleMs: 45000, totalMs: 60000 })).text.trim().slice(0, 30) + '"');
+  let f = null;
+  const up = await step('4. העלאת קובץ שמע קצר', async () => { f = await waitActive(await uploadFile(toneWav(), 'audio/wav', () => {})); return f.state; });
+  if (up) await step('5. האזנה לקובץ שמע', async () => {
+    const r = await callModel(model, buildBody(model, { parts: [{ file_data: { mime_type: 'audio/wav', file_uri: f.uri } }, { text: 'תאר במשפט קצר מה נשמע בהקלטה.' }] }), { idleMs: 60000, totalMs: 90000 });
+    return '"' + r.text.trim().slice(0, 50) + '"';
+  });
+  if (f) deleteRemote(f);
+  line('סיום. צלמו את המסך ושלחו אם משהו נכשל.');
+}
 async function testModel(model) {
   const t0 = Date.now();
   const { text } = await callModel(model, buildBody(model, { parts: [{ text: 'ענה במילה אחת בלבד: שלום' }] }), { idleMs: 45000, totalMs: 60000 });
@@ -1038,6 +1099,7 @@ async function startGenerate() {
 
 async function runPipeline(run) {
   show('proc'); $('#procErr').hidden = true; $('#procHint').hidden = false;
+  diag.length = 0; dlog(`הפקה · ${navigator.userAgent.match(/(CriOS|Chrome|Safari)\/[\d.]+/)?.[0] || ''}`);
   drawSteps(run.transcript);
   let remote = null, step = 'prep';
   try {
@@ -1537,6 +1599,13 @@ function init() {
   };
 
   // settings
+  $('#sDiag').onclick = async () => {
+    const out = $('#sDiagOut'), btn = $('#sDiag'), model = $('#sModel').value || store.get('model');
+    if (!model) return;
+    out.replaceChildren(); out.hidden = false; $('#sDiagLogBox').hidden = false; diag.length = 0; dlog('בדיקת חיבור');
+    btn.classList.add('busy');
+    try { await runDiagnostics(model, out); } finally { btn.classList.remove('busy'); }
+  };
   $('#sTest').onclick = async () => {
     const msg = $('#sMsg'), model = $('#sModel').value, btn = $('#sTest');
     if (!model) return;
