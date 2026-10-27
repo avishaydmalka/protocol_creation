@@ -396,7 +396,7 @@ hr{border:0;border-top:1px solid var(--line);width:100%;margin:4px 0}
     <div class="dlg-head"><h2>הגדרות</h2><button class="icon-btn" value="close" aria-label="סגירה">✕</button></div>
     <label class="fld"><span>מפתח Gemini</span><input id="sKey" type="password" autocomplete="off" dir="ltr"></label>
     <label class="fld"><span>מודל</span><select id="sModel" dir="ltr"></select></label>
-    <div class="row-actions"><button type="button" class="btn small" id="sTest">בדיקת המודל</button><button type="button" class="btn small" id="sRefresh">רענון רשימת המודלים</button></div>
+    <div class="row-actions"><button type="button" class="btn small" id="sFind">מציאת מודל זמין</button><button type="button" class="btn small" id="sTest">בדיקת המודל</button><button type="button" class="btn small" id="sRefresh">רענון רשימת המודלים</button></div>
     <p class="hint">אם מופיעה הודעה על מכסה, אפשר לנסות מודל אחר מהרשימה. מודלי Flash מהירים ומתאימים למסלול החינמי.</p>
     <hr>
     <label class="fld"><span>Client ID של Google</span><input id="sCid" autocomplete="off" dir="ltr"></label>
@@ -591,12 +591,13 @@ const shortName = m => String(m || '').replace('models/', '');
 /* One streamed call. A wall-clock watchdog aborts when nothing arrives for idleMs
    (including before the first byte) or the whole call passes totalMs. Wall-clock
    checks also fire right after the phone wakes from sleep. */
-async function callModel(model, body, { onProgress = null, idleMs = 90000, totalMs = 10 * 60000 } = {}) {
+async function callModel(model, body, { onProgress = null, idleMs = 90000, headMs = 40000, totalMs = 10 * 60000 } = {}) {
   const ac = new AbortController(), start = Date.now();
-  let last = start;
+  let last = start, connected = false;
   const dog = setInterval(() => {
     const now = Date.now();
-    if (now - last > idleMs) ac.abort('idle');
+    if (!connected && now - start > headMs) ac.abort('idle');
+    else if (now - last > idleMs) ac.abort('idle');
     else if (now - start > totalMs) ac.abort('total');
   }, 1000);
   let text = '', finish = '', blocked = false, thinking = false, gotChunk = false;
@@ -604,7 +605,7 @@ async function callModel(model, body, { onProgress = null, idleMs = 90000, total
     const res = await gemFetch(`/v1beta/${model}:streamGenerateContent?alt=sse`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal
     });
-    last = Date.now(); onProgress?.({ chars: 0, thinking: false, connected: true });
+    last = Date.now(); connected = true; onProgress?.({ chars: 0, thinking: false, connected: true });
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = '';
     for (;;) {
@@ -654,14 +655,14 @@ function fallbackModels(current) {
   const flash = ranked.filter(id => /flash/.test(id) && !/lite/.test(id));
   const otherFamily = flash.filter(id => ver(id).split('.')[0] !== ver(current).split('.')[0]);
   const order = [current, otherFamily[0], ...flash, ...ranked];
-  return [...new Set(order.filter(Boolean))].slice(0, 3);
+  return [...new Set(order.filter(Boolean))].slice(0, 4);
 }
 
 async function gemini({ parts, system, schema = null, onRetry = null, onProgress = null, onModel = null }) {
   const first = store.get('model');
   let lastErr = null;
   for (const model of fallbackModels(first)) {
-    if (model !== first) { onRetry?.(`${shortName(lastModelTried)} לא ענה. עובר למודל ${shortName(model)}`); await sleep(1500); onRetry?.(null); }
+    if (model !== first) { onRetry?.(`${shortName(lastModelTried)} עמוס או לא עונה. עובר למודל ${shortName(model)}`); await sleep(1500); onRetry?.(null); }
     lastModelTried = model; onModel?.(model);
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
@@ -684,8 +685,9 @@ async function gemini({ parts, system, schema = null, onRetry = null, onProgress
         lastErr = e;
         if (e.status === 400 && !noThinking.has(model) && /think/i.test(e.message || '')) { noThinking.add(model); attempt--; continue; }
         if (e.timeout || e.next || e.status === 404) break;
+        if ([500, 503].includes(e.status) && attempt >= 1) break;
         if ([429, 500, 503].includes(e.status) && attempt < 2) {
-          const wait = [15, 40][attempt];
+          const wait = e.status === 429 ? [15, 40][attempt] : 5;
           for (let s = wait; s > 0; s--) { onRetry?.(e.status === 429 ? `הגעתם למכסה לדקה הזו. ניסיון חוזר בעוד ${s} שניות` : `Gemini עמוס. ניסיון חוזר בעוד ${s} שניות`); await sleep(1000); }
           onRetry?.(null);
           continue;
@@ -695,7 +697,7 @@ async function gemini({ parts, system, schema = null, onRetry = null, onProgress
       }
     }
   }
-  if (lastErr?.timeout) throw new UserError('Gemini לא ענה, גם אחרי מעבר למודלים אחרים. בדקו את החיבור לאינטרנט, ודאו שהמסך נשאר דלוק, ונסו שוב.');
+  if (lastErr?.timeout || [500, 503].includes(lastErr?.status)) throw new UserError('כל המודלים שנוסו עמוסים או לא עונים כרגע. נסו שוב בעוד כמה דקות. בדקו את החיבור לאינטרנט, ודאו שהמסך נשאר דלוק, ונסו שוב.');
   if (lastErr?.status === 429) throw new UserError('הגעתם למכסה החינמית היומית של Gemini. נסו שוב מחר, או הפעילו חיוב בפרויקט ב-AI Studio.');
   throw lastErr instanceof UserError ? lastErr : new UserError(friendly(lastErr));
 }
@@ -719,7 +721,7 @@ async function runDiagnostics(model, out) {
   line(`מודל: ${shortName(model)} · דפדפן: ${navigator.userAgent.match(/(CriOS|FxiOS|EdgiOS|Chrome|Safari|Firefox)\/[\d.]+/)?.[0] || '?'}`);
   await step('1. רשימת מודלים', async () => `${(await listModels(store.get('gemini_key'))).length} מודלים`);
   await step('2. שאלת טקסט רגילה', async () => {
-    const ac = new AbortController(), to = setTimeout(() => ac.abort('timeout'), 45000);
+    const ac = new AbortController(), to = setTimeout(() => ac.abort('timeout'), 25000);
     try {
       const r = await gemFetch(`/v1beta/${model}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: ac.signal,
         body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'ענה במילה אחת: שלום' }] }] }) });
@@ -736,9 +738,19 @@ async function runDiagnostics(model, out) {
   if (f) deleteRemote(f);
   line('סיום. צלמו את המסך ושלחו אם משהו נכשל.');
 }
+async function findWorkingModel(onStatus = () => {}) {
+  const ranked = rankModels(store.get('models', []));
+  const flash = ranked.filter(id => /flash/.test(id) && !/lite/.test(id));
+  const cands = [...new Set([...flash, ...ranked])].slice(0, 6);
+  for (const m of cands) {
+    onStatus(`בודק את ${shortName(m)}...`);
+    try { await testModel(m); store.set('model', m); return m; } catch {}
+  }
+  return null;
+}
 async function testModel(model) {
   const t0 = Date.now();
-  const { text } = await callModel(model, buildBody(model, { parts: [{ text: 'ענה במילה אחת בלבד: שלום' }] }), { idleMs: 45000, totalMs: 60000 });
+  const { text } = await callModel(model, buildBody(model, { parts: [{ text: 'ענה במילה אחת בלבד: שלום' }] }), { idleMs: 20000, headMs: 20000, totalMs: 30000 });
   if (!text) throw new UserError('המודל החזיר תשובה ריקה.');
   return (Date.now() - t0) / 1000;
 }
@@ -1506,8 +1518,9 @@ function init() {
       const models = await listModels(key);
       if (!models.length) throw new UserError('המפתח תקין, אבל לא נמצאו מודלים זמינים.');
       store.set('gemini_key', key); store.set('models', models);
-      if (!models.some(m => m.id === store.get('model'))) store.set('model', pickDefault(models));
-      msg.textContent = 'המפתח תקין ונשמר.'; msg.className = 'msg ok';
+      store.set('model', pickDefault(models));
+      const working = await findWorkingModel(t => { msg.textContent = 'המפתח תקין. ' + t; });
+      msg.textContent = working ? `המפתח תקין ונשמר. מודל: ${shortName(working)}.` : 'המפתח נשמר, אבל כל המודלים עמוסים כרגע. אפשר להמשיך ולנסות שוב בהמשך.'; msg.className = 'msg ok';
       setTimeout(() => store.get('client_id') ? leaveSetup() : openSetup(2, setupReturn), 600);
     } catch (e) { msg.textContent = e.status === 400 ? 'המפתח לא תקין. בדקו שהעתקתם אותו במלואו.' : friendly(e); msg.className = 'msg err'; }
   };
@@ -1605,6 +1618,17 @@ function init() {
     out.replaceChildren(); out.hidden = false; $('#sDiagLogBox').hidden = false; diag.length = 0; dlog('בדיקת חיבור');
     btn.classList.add('busy');
     try { await runDiagnostics(model, out); } finally { btn.classList.remove('busy'); }
+  };
+  $('#sFind').onclick = async () => {
+    const msg = $('#sMsg'), btn = $('#sFind');
+    btn.classList.add('busy'); msg.className = 'msg';
+    try {
+      if (!store.get('models', []).length) store.set('models', await listModels(store.get('gemini_key')));
+      const m = await findWorkingModel(t => { msg.textContent = t; });
+      if (m) { fillModels(store.get('models', []), m); msg.textContent = `נבחר ${shortName(m)}, שעונה כרגע.`; msg.className = 'msg ok'; }
+      else { msg.textContent = 'כל המודלים עמוסים כרגע. נסו שוב בעוד כמה דקות.'; msg.className = 'msg err'; }
+    } catch (e) { msg.textContent = friendly(e); msg.className = 'msg err'; }
+    finally { btn.classList.remove('busy'); }
   };
   $('#sTest').onclick = async () => {
     const msg = $('#sMsg'), model = $('#sModel').value, btn = $('#sTest');
