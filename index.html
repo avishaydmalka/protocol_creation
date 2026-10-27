@@ -391,7 +391,7 @@ hr{border:0;border-top:1px solid var(--line);width:100%;margin:4px 0}
     <div class="dlg-head"><h2>הגדרות</h2><button class="icon-btn" value="close" aria-label="סגירה">✕</button></div>
     <label class="fld"><span>מפתח Gemini</span><input id="sKey" type="password" autocomplete="off" dir="ltr"></label>
     <label class="fld"><span>מודל</span><select id="sModel" dir="ltr"></select></label>
-    <div><button type="button" class="btn small" id="sRefresh">רענון רשימת המודלים</button></div>
+    <div class="row-actions"><button type="button" class="btn small" id="sTest">בדיקת המודל</button><button type="button" class="btn small" id="sRefresh">רענון רשימת המודלים</button></div>
     <p class="hint">אם מופיעה הודעה על מכסה, אפשר לנסות מודל אחר מהרשימה. מודלי Flash מהירים ומתאימים למסלול החינמי.</p>
     <hr>
     <label class="fld"><span>Client ID של Google</span><input id="sCid" autocomplete="off" dir="ltr"></label>
@@ -497,19 +497,18 @@ async function listModels(key) {
       !/(image|tts|live|embedding|audio|robotics|computer-use|learnlm)/i.test(m.name))
     .map(m => ({ id: m.name, label: m.name.replace('models/', '') }));
 }
-function pickDefault(models) {
-  const score = id => {
-    const n = id.replace('models/', ''); const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
-    let s = v * 100;
-    if (/flash/.test(n)) s += 50;
-    if (/lite/.test(n)) s -= 30;
-    if (/pro/.test(n)) s -= 20;
-    if (/preview|exp/.test(n)) s -= 15;
-    if (/latest/.test(n)) s -= 5;
-    return s;
-  };
-  return [...models].sort((a, b) => score(b.id) - score(a.id))[0]?.id || null;
+function modelScore(id) {
+  const n = String(id).replace('models/', ''); const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  let s = v * 100;
+  if (/flash/.test(n)) s += 50;
+  if (/lite/.test(n)) s -= 30;
+  if (/pro/.test(n)) s -= 20;
+  if (/preview|exp/.test(n)) s -= 15;
+  if (/latest/.test(n)) s -= 5;
+  return s;
 }
+function rankModels(models) { return [...models].map(m => m.id).sort((a, b) => modelScore(b) - modelScore(a)); }
+function pickDefault(models) { return rankModels(models)[0] || null; }
 async function ensureModel() {
   if (store.get('model')) return;
   const models = await listModels(store.get('gemini_key'));
@@ -564,18 +563,32 @@ function thinkingFor(model) {
   if (v >= 2.5) return { thinkingBudget: /pro/.test(n) ? 1024 : 0, includeThoughts: true };
   return null;
 }
-let noThinkingCfg = false;
+const noThinking = new Set();
+const shortName = m => String(m || '').replace('models/', '');
 
-async function readSSE(res, onChunk, idleMs, ac) {
-  const reader = res.body.getReader(), dec = new TextDecoder();
-  let buf = '', idle;
-  const arm = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort('idle'), idleMs); };
-  arm();
+/* One streamed call. A wall-clock watchdog aborts when nothing arrives for idleMs
+   (including before the first byte) or the whole call passes totalMs. Wall-clock
+   checks also fire right after the phone wakes from sleep. */
+async function callModel(model, body, { onProgress = null, idleMs = 90000, totalMs = 10 * 60000 } = {}) {
+  const ac = new AbortController(), start = Date.now();
+  let last = start;
+  const dog = setInterval(() => {
+    const now = Date.now();
+    if (now - last > idleMs) ac.abort('idle');
+    else if (now - start > totalMs) ac.abort('total');
+  }, 1000);
+  let text = '', finish = '', blocked = false, thinking = false;
   try {
+    const res = await gemFetch(`/v1beta/${model}:streamGenerateContent?alt=sse`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal
+    });
+    last = Date.now(); onProgress?.({ chars: 0, thinking: false, connected: true });
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = '';
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
-      arm();
+      last = Date.now();
       buf += dec.decode(value, { stream: true });
       let i;
       while ((i = buf.indexOf('\n')) >= 0) {
@@ -583,31 +596,7 @@ async function readSSE(res, onChunk, idleMs, ac) {
         if (!line.startsWith('data:')) continue;
         const data = line.slice(5).trim();
         if (!data || data === '[DONE]') continue;
-        let obj; try { obj = JSON.parse(data); } catch { continue; }
-        onChunk(obj);
-      }
-    }
-  } finally { clearTimeout(idle); }
-}
-
-async function gemini({ parts, system, schema = null, onRetry = null, onProgress = null }) {
-  const model = store.get('model');
-  const build = withThinking => {
-    const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.2, maxOutputTokens: 32768 } };
-    if (system) body.systemInstruction = { parts: [{ text: system }] };
-    if (schema) { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.responseSchema = schema; }
-    const t = withThinking && thinkingFor(model);
-    if (t) body.generationConfig.thinkingConfig = t;
-    return body;
-  };
-  for (let attempt = 0; ; attempt++) {
-    const ac = new AbortController(), total = setTimeout(() => ac.abort('total'), 10 * 60 * 1000);
-    try {
-      const res = await gemFetch(`/v1beta/${model}:streamGenerateContent?alt=sse`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(build(!noThinkingCfg)), signal: ac.signal
-      });
-      let text = '', finish = '', blocked = false, thinking = false;
-      await readSSE(res, j => {
+        let j; try { j = JSON.parse(data); } catch { continue; }
         if (j.error) { const e = new Error(j.error.message || 'Gemini error'); e.status = j.error.code; throw e; }
         if (j.promptFeedback?.blockReason) blocked = true;
         const cand = j.candidates?.[0];
@@ -616,33 +605,81 @@ async function gemini({ parts, system, schema = null, onRetry = null, onProgress
           if (p.thought) thinking = true;
           else if (p.text) { text += p.text; thinking = false; }
         }
-        onProgress?.({ chars: text.length, thinking });
-      }, 120000, ac);
-      if (!text) {
-        if (blocked || finish === 'SAFETY' || finish === 'PROHIBITED_CONTENT') throw new UserError('Gemini סירב לעבד את ההקלטה. נסו שוב או בחרו מודל אחר.');
-        throw new UserError('התקבלה תשובה ריקה מ-Gemini. נסו שוב.');
+        onProgress?.({ chars: text.length, thinking, connected: true });
       }
-      if (!schema) return text.trim();
-      try { return JSON.parse(text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')); }
-      catch {
-        if (finish === 'MAX_TOKENS') throw new UserError('הפרוטוקול ארוך מדי לתשובה אחת. נסו לפצל את ההקלטה לשני חלקים.');
-        throw new UserError('Gemini החזיר פרוטוקול לא תקין. נסו שוב.');
+    }
+    return { text, finish, blocked };
+  } catch (e) {
+    if (ac.signal.aborted) { const err = new Error('timeout'); err.timeout = ac.signal.reason || 'idle'; throw err; }
+    throw e;
+  } finally { clearInterval(dog); }
+}
+
+function buildBody(model, { parts, system, schema }) {
+  const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.2, maxOutputTokens: 32768 } };
+  if (system) body.systemInstruction = { parts: [{ text: system }] };
+  if (schema) { body.generationConfig.responseMimeType = 'application/json'; body.generationConfig.responseSchema = schema; }
+  const t = !noThinking.has(model) && thinkingFor(model);
+  if (t) body.generationConfig.thinkingConfig = t;
+  return body;
+}
+
+function fallbackModels(current) {
+  const ranked = rankModels(store.get('models', [])).filter(id => id !== current);
+  const flash = ranked.filter(id => /flash/.test(id) && !/lite/.test(id));
+  const rest = ranked.filter(id => !flash.includes(id));
+  return [current, ...flash, ...rest].filter(Boolean).slice(0, 3);
+}
+
+async function gemini({ parts, system, schema = null, onRetry = null, onProgress = null, onModel = null }) {
+  const first = store.get('model');
+  let lastErr = null;
+  for (const model of fallbackModels(first)) {
+    if (model !== first) { onRetry?.(`${shortName(lastModelTried)} לא ענה. עובר למודל ${shortName(model)}`); await sleep(1500); onRetry?.(null); }
+    lastModelTried = model; onModel?.(model);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const { text, finish, blocked } = await callModel(model, buildBody(model, { parts, system, schema }), { onProgress });
+        if (!text) {
+          if (blocked || finish === 'SAFETY' || finish === 'PROHIBITED_CONTENT') throw new UserError('Gemini סירב לעבד את ההקלטה. נסו שוב או בחרו מודל אחר.');
+          const e = new UserError('התקבלה תשובה ריקה מ-Gemini.'); e.next = true; throw e;
+        }
+        let out = text.trim();
+        if (schema) {
+          try { out = JSON.parse(out.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')); }
+          catch {
+            if (finish === 'MAX_TOKENS') throw new UserError('הפרוטוקול ארוך מדי לתשובה אחת. נסו לפצל את ההקלטה לשני חלקים.');
+            const e = new UserError('Gemini החזיר פרוטוקול לא תקין.'); e.next = true; throw e;
+          }
+        }
+        if (model !== first) { store.set('model', model); toast(`עברתי למודל ${shortName(model)}, שעונה מהר יותר. אפשר לשנות בהגדרות.`); }
+        return out;
+      } catch (e) {
+        lastErr = e;
+        if (e.status === 400 && !noThinking.has(model) && /think/i.test(e.message || '')) { noThinking.add(model); attempt--; continue; }
+        if (e.timeout || e.next || e.status === 404) break;
+        if ([429, 500, 503].includes(e.status) && attempt < 2) {
+          const wait = [15, 40][attempt];
+          for (let s = wait; s > 0; s--) { onRetry?.(e.status === 429 ? `הגעתם למכסה לדקה הזו. ניסיון חוזר בעוד ${s} שניות` : `Gemini עמוס. ניסיון חוזר בעוד ${s} שניות`); await sleep(1000); }
+          onRetry?.(null);
+          continue;
+        }
+        if ([429, 500, 503].includes(e.status)) break;
+        throw e;
       }
-    } catch (e) {
-      if (e?.status === 400 && !noThinkingCfg && /think/i.test(e.message || '')) { noThinkingCfg = true; attempt--; continue; }
-      if (e?.name === 'AbortError' || ac.signal.aborted) {
-        if (ac.signal.reason === 'idle' && attempt < 2) { onRetry?.('Gemini הפסיק לענות. מנסה שוב...'); await sleep(1500); onRetry?.(null); continue; }
-        throw new UserError('Gemini לא השלים את התשובה. ייתכן שהמסך ננעל או שהחיבור נקטע. נסו שוב, או בחרו מודל אחר בהגדרות.');
-      }
-      if ([429, 500, 503].includes(e.status) && attempt < 3) {
-        const wait = [10, 30, 60][attempt];
-        for (let s = wait; s > 0; s--) { onRetry?.(e.status === 429 ? `הגעתם למכסה לדקה הזו. ניסיון חוזר בעוד ${s} שניות` : `Gemini עמוס. ניסיון חוזר בעוד ${s} שניות`); await sleep(1000); }
-        onRetry?.(null);
-        continue;
-      }
-      throw e;
-    } finally { clearTimeout(total); }
+    }
   }
+  if (lastErr?.timeout) throw new UserError('Gemini לא ענה, גם אחרי מעבר למודלים אחרים. בדקו את החיבור לאינטרנט, ודאו שהמסך נשאר דלוק, ונסו שוב.');
+  if (lastErr?.status === 429) throw new UserError('הגעתם למכסה החינמית היומית של Gemini. נסו שוב מחר, או הפעילו חיוב בפרויקט ב-AI Studio.');
+  throw lastErr instanceof UserError ? lastErr : new UserError(friendly(lastErr));
+}
+let lastModelTried = null;
+
+async function testModel(model) {
+  const t0 = Date.now();
+  const { text } = await callModel(model, buildBody(model, { parts: [{ text: 'ענה במילה אחת בלבד: שלום' }] }), { idleMs: 45000, totalMs: 60000 });
+  if (!text) throw new UserError('המודל החזיר תשובה ריקה.');
+  return (Date.now() - t0) / 1000;
 }
 
 /* ---------------- protocol schema & prompts ---------------- */
@@ -1027,7 +1064,7 @@ async function runPipeline(run) {
     const tick = setInterval(() => {
       if (retryMsg) return;
       const el = fmtDur((Date.now() - t0) / 1000);
-      const what = !progress ? 'ממתין לתשובה' : progress.chars ? `התקבלו ${progress.chars.toLocaleString('he-IL')} תווים` : 'Gemini חושב';
+      const what = !progress ? 'מתחבר ל-Gemini' : progress.chars ? `התקבלו ${progress.chars.toLocaleString('he-IL')} תווים` : progress.thinking ? 'Gemini חושב' : 'Gemini מאזין';
       setStep('write', 'run', `כתיבת הפרוטוקול (${el} · ${what})`);
     }, 1000);
     $('#procHint').textContent = `מודל: ${String(store.get('model')).replace('models/', '')}. ישיבה של שעה לוקחת בדרך כלל דקה עד שלוש דקות. השאירו את המסך דלוק והדף פתוח.`;
@@ -1038,7 +1075,8 @@ async function runPipeline(run) {
         parts: [filePart, { text: contextText(run.meta) + '\n\nהאזן להקלטה המצורפת וכתוב פרוטוקול מלא של הישיבה לפי המבנה המבוקש.' }],
         system: SYS_PROTOCOL, schema: SCHEMA,
         onRetry: m => { retryMsg = m; if (m) setStep('write', 'run', m); },
-        onProgress: pr => { progress = pr; }
+        onProgress: pr => { progress = pr; },
+        onModel: m => { progress = null; $('#procHint').textContent = `מודל: ${shortName(m)}. ישיבה של שעה לוקחת בדרך כלל דקה עד שלוש דקות. השאירו את המסך דלוק והדף פתוח.`; }
       }));
     } finally { clearInterval(tick); }
     setStep('write', 'done', 'כתיבת הפרוטוקול');
@@ -1499,6 +1537,14 @@ function init() {
   };
 
   // settings
+  $('#sTest').onclick = async () => {
+    const msg = $('#sMsg'), model = $('#sModel').value, btn = $('#sTest');
+    if (!model) return;
+    btn.classList.add('busy'); msg.textContent = `בודק את ${shortName(model)}...`; msg.className = 'msg';
+    try { const sec = await testModel(model); msg.textContent = `${shortName(model)} ענה תוך ${sec.toFixed(1)} שניות.`; msg.className = 'msg ok'; }
+    catch (e) { msg.textContent = e.timeout ? `${shortName(model)} לא ענה. בחרו מודל אחר.` : friendly(e); msg.className = 'msg err'; }
+    finally { btn.classList.remove('busy'); }
+  };
   $('#sRefresh').onclick = async () => {
     const msg = $('#sMsg'); msg.textContent = 'טוען מודלים...'; msg.className = 'msg';
     try {
